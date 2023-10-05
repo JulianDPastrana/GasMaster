@@ -31,13 +31,29 @@ class SpectralMixtureGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+class MultitaskGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.MultitaskMean(
+                gpytorch.means.ConstantMean(), num_tasks=4
+                )
+        self.covar_module = gpytorch.kernels.MultitaskKernel(
+                gpytorch.kernels.RBFKernel(), num_tasks=4, rank=4
+                )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultitaskMultivariateNormal(mean_x, covar_x)
+
+
 def train(model, likelihood, training_iter=1000):
     # Use the Adam optmizer  
     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
             optimizer=optimizer,
-            milestones=[.5*training_iter, .75*training_iter],
-            gamma=0.1
+            gamma=0.99,
+            verbose=False
             )
     # "Loss" for GPs - the marginal log likelihood
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
@@ -60,6 +76,7 @@ def train(model, likelihood, training_iter=1000):
 
     plt.plot(loss_array)
     plt.savefig("./figures/learning_curve.png")
+    plt.close()
 
 # Make predictions with the model
 def predict(model, likelihood, test_x):
@@ -128,17 +145,83 @@ def plot(model, likelihood, test_x, test_y):
     final_mae = gpytorch.metrics.mean_absolute_error(y_posterior, test_y)
 
     print(f'Untrained model MAE: {init_mae:.2f}, \nTrained model MAE: {final_mae:.2f}')
-# Set Up training data 
-train_x = torch.linspace(0, 0.6, 50)
-train_y = torch.sin(train_x * 2 * np.pi) + torch.randn(train_x.size()) * np.sqrt(0.01)
-test_x = torch.linspace(0, 1, 100)
-test_y = torch.sin(test_x * 2 * np.pi) + torch.randn(test_x.size()) * np.sqrt(0.01)
-# The likelihood
-likelihood = gpytorch.likelihoods.GaussianLikelihood()
-model = ExactGPModel(train_x, train_y, likelihood)
-# model = SpectralMixtureGPModel(train_x, train_y, likelihood)
 
-plot(model, likelihood, test_x, test_y)
+def correlation_from_covariance(covariance):
+    v = np.sqrt(np.diag(covariance))
+    outer_v = np.outer(v, v)
+    correlation = covariance / outer_v
+    correlation[covariance == 0] = 0
+    return correlation
+# Set Up training data 
+
+def y(x):
+    return torch.stack([
+        torch.sin(x * 2 * torch.pi) + torch.randn(x.size()) * np.sqrt(0.04),
+        torch.sign(torch.sin(x * 4 * torch.pi)) + torch.randn(x.size()) * np.sqrt(0.04),
+        x + torch.rand(x.size()) * np.sqrt(0.04),
+        1 + torch.rand(x.size()) * np.sqrt(0.04),
+        ], -1)
+train_x = torch.linspace(0, 0.6, 50)
+train_y = y(train_x)
+test_x = torch.linspace(0, 1, 100)
+test_y = y(test_x)
+# The likelihood
+likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=4)
+model = MultitaskGPModel(train_x, train_y, likelihood)
+# model = SpectralMixtureGPModel(train_x, train_y, likelihood)
+train(model, likelihood)
+
+# Set into eval mode
+model.eval()
+likelihood.eval()
+# Make predictions
+with torch.no_grad(), gpytorch.settings.fast_pred_var():
+    predictions = likelihood(model(test_x))
+    mean = predictions.mean
+    lower, upper = predictions.confidence_region()
+# Number of tasks
+n_tasks = 4  # Change this to the number of tasks you have
+
+# Calculate the number of rows and columns for the subplot grid
+n_rows = int(n_tasks ** 0.5)
+n_cols = n_tasks // n_rows + (n_tasks % n_rows > 0)
+
+# Initialize plots with squared subplots
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(10, 10))
+
+# Flatten the axes array for easier iteration
+axes = axes.flatten()
+
+# Iterate over tasks
+for i in range(n_tasks):
+    ax = axes[i]
+
+    # Plot training data as black stars
+    ax.plot(train_x.detach().numpy(), train_y[:, i].detach().numpy(), 'k*')
+    ax.plot(test_x.detach().numpy(), test_y[:, i].detach().numpy(), 'r*')
+    
+    # Predictive mean as blue line
+    ax.plot(test_x.numpy(), mean[:, i].numpy(), 'b')
+    
+    # Shade in confidence
+    ax.fill_between(test_x.numpy(), lower[:, i].numpy(), upper[:, i].numpy(), alpha=0.5)
+    
+    ax.legend(['Training Data', 'Testing Data', 'Mean', 'Confidence'])
+    ax.set_title(f'Observed Values (Task {i+1})')
+
+# Remove any empty subplots if n_tasks is not a perfect square
+for i in range(n_tasks, n_rows * n_cols):
+    fig.delaxes(axes[i])
+
+plt.tight_layout()
+plt.show()
+
+H = model.covar_module.task_covar_module.covar_factor.detach().numpy()
+
+sns.heatmap(correlation_from_covariance(H @ H.T), annot=True)
+plt.show()
+
+
 # Save The Model
 torch.save(model.state_dict(), './models/model_state.pth')
 
